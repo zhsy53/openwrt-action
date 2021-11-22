@@ -1,0 +1,102 @@
+name: compile openwrt
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  repository_dispatch:
+
+env:
+  CONTEXT_INIT_SCRIPT: openwrt/context.sh
+
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  # work dir
+  REPO_DIR: ./openwrt_repo
+
+  # feeds
+  FEEDS_FILE: openwrt/feeds.conf.default
+  FEED_SCRIPT: openwrt/feed.sh
+
+  # config
+  CONFIG_FILE: openwrt/.config
+  CONFIG_SCRIPT: openwrt/config.sh
+
+  UPLOAD_RELEASE: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: checkout
+      uses: actions/checkout@main
+
+    - name: initialization context
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        chmod +x $CONTEXT_INIT_SCRIPT $FEED_SCRIPT $CONFIG_SCRIPT
+        $GITHUB_WORKSPACE/$CONTEXT_INIT_SCRIPT
+
+    - name: clone source
+      run: git clone $REPO_URL -b $REPO_BRANCH $REPO_DIR
+
+    - name: setup feeds
+      working-directory: openwrt_repo
+      run: |
+        [ -e $GITHUB_WORKSPACE/$FEEDS_FILE ] && mv $GITHUB_WORKSPACE/$FEEDS_FILE feeds.conf.default
+        $GITHUB_WORKSPACE/$FEED_SCRIPT
+
+    - name: update&install feeds
+      working-directory: openwrt_repo
+      run: ./scripts/feeds update -a && ./scripts/feeds install -a
+
+    - name: setup config
+      run: |
+        [ -e $GITHUB_WORKSPACE/$CONFIG_FILE ] && mv $GITHUB_WORKSPACE/$CONFIG_FILE .config
+        $GITHUB_WORKSPACE/$CONFIG_SCRIPT
+
+    - name: download package
+      working-directory: openwrt_repo
+      run: |
+        make defconfig
+        make -j $(($(nproc)+1)) download
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: compile firmware
+      working-directory: openwrt_repo
+      run: make -j $(nproc)
+
+    - name: setup upload files
+      id: tag
+      working-directory: openwrt_repo
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "::set-output name=release_tag::$(date +"%Y.%m.%d-%H%M")"
+        cd bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+
+    - name: upload releases
+      uses: softprops/action-gh-release@v1
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: delete old workflow runs
+      uses: GitRML/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
+
+    - name: remove old releases
+      uses: dev-drprasad/delete-older-releases@v0.1.0
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        keep_latest: 3
+        delete_tags: true
